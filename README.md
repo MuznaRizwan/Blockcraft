@@ -1,61 +1,59 @@
-# Blockcraft server
+# Blockcraft on Vercel
 
-One Node.js process serves the game page and its API. Data is stored in a SQLite file.
-No npm packages are needed: it uses Node's built-in `node:sqlite` (Node 22.13 or newer).
+The game page is a static file (`public/index.html`). The server part is one serverless function
+(`api/[...path].js`) that answers every `/api/*` request. Data lives in a Turso (libSQL) database,
+because Vercel functions have no disk that survives between requests.
 
-## Run locally
+## 1. Create the database (Turso)
 
-    npm start            # http://localhost:3000
-    npm test             # 18 API tests, each run against a temporary database
+    curl -sSfL https://get.tur.so/install.sh | bash      # or: brew install tursodatabase/tap/turso
+    turso auth signup
+    turso db create blockcraft
+    turso db show blockcraft --url          # copy this: libsql://blockcraft-yourname.turso.io
+    turso db tokens create blockcraft       # copy this token
 
-## Environment variables
+The function creates its own tables the first time it runs. You do not need to run any SQL.
 
-| Variable | Required | Purpose |
-|---|---|---|
-| `BLOCKCRAFT_KEY` | Yes in production | Secret used to encrypt authenticator keys at rest. Keep it safe: changing it makes existing sign-ins fail. |
-| `DATA_DIR` | Recommended | Folder for `blockcraft.db` and the key file. Put it on a persistent disk. Default `./data`. |
-| `COOKIE_SECURE` | Yes behind HTTPS | Set to `1` so the session cookie is sent only over HTTPS. Also turns on HSTS. |
-| `PORT` | No | Defaults to 3000. Hosts usually set this for you. |
+## 2. Set three environment variables in Vercel
 
-## Endpoints
+Project, then Settings, then Environment Variables (tick Production, Preview and Development):
 
-| Method and path | Purpose |
+| Name | Value |
 |---|---|
-| `POST /api/signup` | Validate details and hold the sign-up. Returns the authenticator key. |
-| `POST /api/signup/confirm` | Check the first 6-digit code and create the account. Starts a session. |
-| `POST /api/login` | Check the password (with lockout). Returns a pending sign-in. |
-| `POST /api/login/confirm` | Check the 6-digit code and start a session. |
-| `POST /api/logout`, `GET /api/me` | End or read the current session. |
-| `GET /api/profile` | Play time, blocks placed and broken, best round, last 5 finished games. |
-| `POST /api/stats` | Add to play time and block counts (batched by the page). |
-| `POST /api/games` | Record a finished round or game. |
-| `GET /api/worlds`, `GET/PUT/DELETE /api/worlds/:id` | List, load, save and delete your worlds (up to 8). |
+| `TURSO_DATABASE_URL` | the `libsql://...` address from step 1 |
+| `TURSO_AUTH_TOKEN` | the token from step 1 |
+| `BLOCKCRAFT_KEY` | a long random secret: `openssl rand -base64 48`. Keep a copy. Changing it later makes every existing sign-in fail, because it encrypts the authenticator keys. |
 
-## Security in place
+Optional: `ALLOWED_ORIGINS` (comma-separated) if a different website needs to call this API.
 
-- Passwords are hashed with PBKDF2-SHA256 (210,000 rounds) and a random salt per user. The plain password is never stored or logged.
-- Every sign-up and sign-in needs a 6-digit code from an authenticator app (RFC 6238). A code cannot be used twice.
-- Authenticator keys are encrypted with AES-256-GCM before they go into the database.
-- Five wrong passwords or codes lock the account, with the wait doubling up to 15 minutes.
-- Sessions use random tokens. Only a SHA-256 hash of each token is stored. The cookie is HttpOnly and SameSite=Strict, and expires after 12 hours.
-- Every input is checked on the server, with the same rules as the page. Worlds are checked block by block, and the bottom layer can't be broken.
-- Every SQL statement uses parameters. User text is never built into queries.
-- Writes must be JSON from the same origin. Request bodies are limited to 300 KB.
-- Sign-in responses do not reveal whether an email is registered.
-- Security headers include a Content-Security-Policy, nosniff, frame denial and no-referrer.
+## 3. Deploy
 
-## Deploying (for example Render, Railway or Fly.io)
+Push this folder to GitHub and import it in Vercel. Framework preset: **Other**. No build command and no output
+directory are needed: Vercel serves `public/` as the site and `api/` as the functions.
+After adding or changing environment variables, redeploy, since they only apply to new deployments.
 
-1. Create a web service from this folder. Build command: none. Start command: `npm start`.
-2. Use Node 22.13 or newer. Set `NODE_VERSION` to `22` if the host asks.
-3. Add a persistent disk or volume, mounted at `/data`, and set `DATA_DIR=/data`. SQLite needs a disk that survives restarts. Without one, every deploy wipes all accounts.
-4. Set `BLOCKCRAFT_KEY` to a long random string, and `COOKIE_SECURE=1`.
-5. Open the service URL. The game and its sign-in are served from the same address.
+To check it: open `https://YOUR-SITE.vercel.app/api/healthz` (should show `{"ok":true}`), then open the site and sign up.
+If something fails, open the project in Vercel, then Logs. A missing setting is named in the log.
+
+**Pick a region near your database.** In Vercel, Settings, Functions, set the region to match your Turso location.
+A far-away function makes every request slower, because each request makes several database calls.
+
+## Run the tests
+
+    npm install
+    npm test        # 21 API tests, against a temporary local database file
+
+## What changed from the Express version
+
+- No Express and no CORS package. Page and API share one address, so cross-site access is not needed and stays blocked.
+- Every database call is awaited (the libSQL client is async), and multi-step changes use all-or-nothing batches.
+- The sign-up and login rate limits are stored in the database, because each request may run on a different instance.
+- The authenticator-key secret comes from `BLOCKCRAFT_KEY`, not a file, and `public/index.html` is served by Vercel itself.
+- Password hashing runs asynchronously so it does not block the function.
 
 ## Limits to know about
 
-- **Lost authenticator means lost account.** There are no backup codes or email recovery yet.
-- SQLite runs on one server instance. Scaling out would need a shared database such as Postgres or Supabase.
-- Rate limits are kept in memory, so they reset on restart.
-- Play stats are reported by the browser, so a player could inflate their own numbers. That is fine for stats, but not for competitive scores.
-- The page still uses `'unsafe-inline'` for scripts because it is one HTML file. Moving the script into a separate file would remove that.
+- Lost authenticator means lost account: there are no backup codes or email recovery yet.
+- Free Vercel plans cap function time (10 seconds by default). Sign-up and login take well under one second.
+- Play stats are reported by the browser, so they are fine for fun but not for competitive scores.
+- The page still allows inline scripts because it is one HTML file.
