@@ -347,6 +347,7 @@ function openVerify(){
 }
 bind(fs,{username:"username",email:"email",phone:"phone",password:"password",confirm:"confirm"},function(f){
  api("POST","/api/signup",{username:f.elements.username.value,email:f.elements.email.value,phone:f.elements.phone.value,password:cleanPw(f.elements.password.value)}).then(function(j){
+if(j.user){user=j.user.username;pend=null;f.reset();$$("li",rules).forEach(function(li){li.classList.remove("ok")});to("dashboard");return}
   pend={mode:"signup",id:j.pending,secret:j.secret};
   $$("li",rules).forEach(function(li){li.classList.remove("ok")});
   f.reset();openVerify();
@@ -354,6 +355,7 @@ bind(fs,{username:"username",email:"email",phone:"phone",password:"password",con
 });
 bind($("#f-login"),{email:"email",password:"loginpw"},function(f){
  api("POST","/api/login",{email:f.elements.email.value,password:cleanPw(f.elements.password.value)}).then(function(j){
+    if(j.user){user=j.user.username;pend=null;f.reset();to("dashboard");return}
   pend={mode:"login",id:j.pending};f.reset();openVerify();
  }).catch(function(e){fieldErr(f.elements.password,e.message)});
 });
