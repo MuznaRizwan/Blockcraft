@@ -1,8 +1,9 @@
 'use strict';
 // Blockcraft API as one Vercel serverless function (catch-all route: /api/*).
-// Database: Turso (libSQL). Every database call is async, so every one is awaited.
+// Database: Supabase (Postgres), reached through Supabase's connection pooler. Every database call is async, so every one is awaited.
 const crypto = require('node:crypto');
 const { promisify } = require('node:util');
+const postgres = require('postgres');
 const pbkdf2 = promisify(crypto.pbkdf2);
 
 const N = 48, H = 24, CELLS = N * N * H, LAYER = N * N;
@@ -19,11 +20,22 @@ const ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || '').split(',').map
 let _db, _key, _ready;
 function database() {
   if (!_db) {
-    const url = process.env.TURSO_DATABASE_URL;
-    if (!url) throw new Error('TURSO_DATABASE_URL is not set');
-    // The "web" client is small and has no native parts, which suits serverless. file: URLs (local tests only) need the node client.
-    const lib = url.startsWith('file:') ? require(['@libsql', 'client'].join('/')) : require('@libsql/client/web');
-    _db = lib.createClient({ url, authToken: process.env.TURSO_AUTH_TOKEN });
+    // Use the Supabase *transaction pooler* string (port 6543): Dashboard > Connect > Transaction pooler.
+    // The Vercel + Supabase integration provides the same thing as POSTGRES_URL.
+    const raw = process.env.DATABASE_URL || process.env.POSTGRES_URL;
+    if (!raw) throw new Error('DATABASE_URL is not set');
+    const u = new URL(raw);
+    u.searchParams.delete('supa'); // added by the Vercel integration; the driver would forward it to the server as an unknown setting
+    const local = u.hostname === 'localhost' || u.hostname === '127.0.0.1';
+    _db = postgres(u.toString(), {
+      prepare: false,      // required by the transaction pooler (no prepared statements)
+      max: 1,              // one connection per function instance; the pooler does the real pooling
+      idle_timeout: 20,
+      connect_timeout: 10,
+      ssl: local ? false : 'require',
+      // bigint columns hold millisecond timestamps and ids; return them as plain numbers (safe below 2^53)
+      types: { bigint: { to: 20, from: [20], serialize: (x) => String(x), parse: (x) => Number(x) } },
+    });
   }
   return _db;
 }
@@ -36,71 +48,87 @@ function key() {
   return _key;
 }
 
+// Row Level Security is switched on with no policies: Supabase exposes the public schema through its
+// REST API, and this locks that door. This server connects as the postgres role, which bypasses RLS.
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY,
-  username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  username TEXT NOT NULL,
   email TEXT NOT NULL UNIQUE,
   phone TEXT NOT NULL,
   pw_salt TEXT NOT NULL,
   pw_hash TEXT NOT NULL,
   totp_enc TEXT NOT NULL,
-  last_step INTEGER NOT NULL DEFAULT 0,
+  last_step BIGINT NOT NULL DEFAULT 0,
   fails INTEGER NOT NULL DEFAULT 0,
-  lock_until INTEGER NOT NULL DEFAULT 0,
-  created INTEGER NOT NULL
+  lock_until BIGINT NOT NULL DEFAULT 0,
+  created BIGINT NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower ON users (lower(username));
 CREATE TABLE IF NOT EXISTS profiles (
-  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  play_secs INTEGER NOT NULL DEFAULT 0,
-  placed INTEGER NOT NULL DEFAULT 0,
-  broken INTEGER NOT NULL DEFAULT 0
+  user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  play_secs BIGINT NOT NULL DEFAULT 0,
+  placed BIGINT NOT NULL DEFAULT 0,
+  broken BIGINT NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS games (
-  id INTEGER PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   round INTEGER NOT NULL,
-  score INTEGER NOT NULL,
-  over INTEGER NOT NULL,
-  created INTEGER NOT NULL
+  score BIGINT NOT NULL,
+  over SMALLINT NOT NULL,
+  created BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS games_user ON games(user_id, created);
 CREATE TABLE IF NOT EXISTS worlds (
   id TEXT PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   edits TEXT NOT NULL,
-  saved INTEGER NOT NULL
+  saved BIGINT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS pending (
   id TEXT PRIMARY KEY,
   kind TEXT NOT NULL,
-  user_id INTEGER,
+  user_id BIGINT,
   data TEXT NOT NULL,
-  expires INTEGER NOT NULL,
+  expires BIGINT NOT NULL,
   fails INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS sessions (
   token TEXT PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  expires INTEGER NOT NULL
+  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires BIGINT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS rate (
   k TEXT PRIMARY KEY,
   n INTEGER NOT NULL,
-  reset INTEGER NOT NULL
+  reset BIGINT NOT NULL
 );
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE games ENABLE ROW LEVEL SECURITY;
+ALTER TABLE worlds ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pending ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE rate ENABLE ROW LEVEL SECURITY;
 `;
+// Creates the tables on first use. Once they exist you can set AUTO_MIGRATE=0 to skip this step on cold starts.
 function ready() {
-  if (!_ready) _ready = database().executeMultiple(SCHEMA).catch((e) => { _ready = null; throw e; });
+  if (process.env.AUTO_MIGRATE === '0') return Promise.resolve();
+  if (!_ready) _ready = database().unsafe(SCHEMA).then(() => undefined).catch((e) => { _ready = null; throw e; });
   return _ready;
 }
 
 // ---------- tiny database helpers ----------
-const run = (sql, args = []) => database().execute({ sql, args });
-const rows = async (sql, args) => (await run(sql, args)).rows;
+// Queries below are written with ? placeholders; this turns them into Postgres $1, $2, ...
+const pg = (s) => { let i = 0; return s.replace(/\?/g, () => '$' + (++i)); };
+const run = (sql, args = []) => database().unsafe(pg(sql), args);
+const rows = (sql, args) => run(sql, args);
 const one = async (sql, args) => (await rows(sql, args))[0] || null;
-const batch = (stmts) => database().batch(stmts, 'write'); // all-or-nothing
+// Runs fn inside one all-or-nothing transaction. fn receives a query function q(sql, args).
+const transaction = (fn) => database().begin((tx) => fn((sql, args = []) => tx.unsafe(pg(sql), args)));
+const batch = (stmts) => transaction(async (q) => { for (const s of stmts) await q(s.sql, s.args); });
 
 let lastSweep = 0;
 async function sweep() {
@@ -165,6 +193,7 @@ const rid = (n) => crypto.randomBytes(n).toString('base64url');
 const sha = (s) => crypto.createHash('sha256').update(s).digest('base64url');
 const clean = (v, max) => String(v == null ? '' : v).normalize('NFKC').replace(CTRL, '').trim().slice(0, max);
 function httpErr(status, message) { return Object.assign(new Error(message), { status }); }
+const isUniqueViolation = (e) => e && e.code === '23505'; // Postgres "unique_violation"
 
 function validate({ username, email, phone, password }) {
   if ([username, email, phone, password].some((x) => typeof x !== 'string')) throw httpErr(400, 'Every field is required.');
@@ -203,9 +232,9 @@ async function limited(ip, bucket, max) {
   const t = Date.now();
   const r = await one(
     `INSERT INTO rate (k, n, reset) VALUES (?, 1, ?)
-     ON CONFLICT(k) DO UPDATE SET
-       n = CASE WHEN reset < ? THEN 1 ELSE n + 1 END,
-       reset = CASE WHEN reset < ? THEN ? ELSE reset END
+     ON CONFLICT (k) DO UPDATE SET
+       n = CASE WHEN rate.reset < ? THEN 1 ELSE rate.n + 1 END,
+       reset = CASE WHEN rate.reset < ? THEN ?::bigint ELSE rate.reset END
      RETURNING n`,
     [bucket + '|' + ip, t + 60e3, t, t, t + 60e3],
   );
@@ -303,7 +332,7 @@ async function route(req, res) {
   if (m === 'POST' && p === '/api/signup') {
     if (await limited(ip, 'signup', 10)) throw httpErr(429, 'Too many sign-up attempts. Wait a minute.');
     const v = validate(body);
-    if (await one('SELECT 1 AS x FROM users WHERE username = ? OR email = ?', [v.username, v.email]))
+    if (await one('SELECT 1 AS x FROM users WHERE lower(username) = lower(?) OR email = ?', [v.username, v.email]))
       throw httpErr(409, 'That username or email is already registered.');
     const salt = crypto.randomBytes(16);
     const secret = b32encode(crypto.randomBytes(20));
@@ -328,18 +357,22 @@ async function route(req, res) {
       await run('UPDATE pending SET fails = fails + 1 WHERE id = ?', [row.id]);
       throw httpErr(401, 'That code is not valid or has expired.');
     }
+    let uid;
     try {
-      await batch([ // one all-or-nothing step: the account, its profile row, and removal of the pending sign-up
-        { sql: 'INSERT INTO users (username, email, phone, pw_salt, pw_hash, totp_enc, last_step, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', args: [d.username, d.email, d.phone, d.pw_salt, d.pw_hash, d.totp, step, Date.now()] },
-        { sql: 'INSERT INTO profiles (user_id) SELECT id FROM users WHERE username = ?', args: [d.username] },
-        { sql: 'DELETE FROM pending WHERE id = ?', args: [row.id] },
-      ]);
+      uid = await transaction(async (q) => { // one all-or-nothing step: the account, its profile row, and removal of the pending sign-up
+        const r = await q(
+          'INSERT INTO users (username, email, phone, pw_salt, pw_hash, totp_enc, last_step, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id',
+          [d.username, d.email, d.phone, d.pw_salt, d.pw_hash, d.totp, step, Date.now()],
+        );
+        await q('INSERT INTO profiles (user_id) VALUES (?)', [r[0].id]);
+        await q('DELETE FROM pending WHERE id = ?', [row.id]);
+        return Number(r[0].id);
+      });
     } catch (e) {
-      if (/UNIQUE|constraint/i.test(String(e.message))) throw httpErr(409, 'That username or email is already registered.');
+      if (isUniqueViolation(e)) throw httpErr(409, 'That username or email is already registered.');
       throw e;
     }
-    const u = await one('SELECT id FROM users WHERE username = ?', [d.username]);
-    return startSession(res, Number(u.id), d.username);
+    return startSession(res, uid, d.username);
   }
 
   // Sign-in step 1: check the password (with lockout), then hold the sign-in for the code.
@@ -425,7 +458,7 @@ async function route(req, res) {
 
   if (p === '/api/worlds' && m === 'GET') {
     const u = need();
-    const list = await rows('SELECT id, name, saved, json_array_length(edits) AS changes FROM worlds WHERE user_id = ? ORDER BY saved DESC', [u.id]);
+    const list = await rows('SELECT id, name, saved, jsonb_array_length(edits::jsonb) AS changes FROM worlds WHERE user_id = ? ORDER BY saved DESC', [u.id]);
     return send(res, 200, { worlds: list.map((w) => ({ id: String(w.id), name: String(w.name), saved: Number(w.saved), changes: Number(w.changes) })) });
   }
 
