@@ -1,0 +1,13 @@
+{
+  "name": "blockcraft-vercel",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Blockcraft on Vercel: static game page plus a serverless API backed by Turso (libSQL)",
+  "engines": { "node": "22.x" },
+  "dependencies": {
+    "@libsql/client": "^0.15.0"
+  },
+  "scripts": {
+    "test": "node --test tests/api.test.js"
+  }
+}
