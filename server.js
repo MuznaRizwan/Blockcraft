@@ -5,10 +5,17 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { DatabaseSync } = require('node:sqlite');
+let DatabaseSync;
+try {
+  ({ DatabaseSync } = require('node:sqlite'));
+} catch {
+  console.error(`Blockcraft needs Node 22.13 or newer, but this is ${process.version}. Use a newer Node image (for example node:22).`);
+  process.exit(1);
+}
 
 const PORT = Number(process.env.PORT) || 3000;
 const SECURE = process.env.COOKIE_SECURE === '1'; // set to 1 when served over HTTPS
+const TRUST_PROXY = process.env.TRUST_PROXY === '1'; // set to 1 behind Fly.io or another proxy that sets the client address
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const N = 48, H = 24, CELLS = N * N * H, LAYER = N * N;
 const MAX_WORLDS = 8, MAX_EDITS = 20000, BODY_MAX = 300 * 1024;
@@ -265,7 +272,8 @@ function readJson(req) {
 
 // ---------- API routes ----------
 async function api(req, res, url) {
-  const p = url.pathname, m = req.method, ip = req.socket.remoteAddress || 'unknown';
+  const p = url.pathname, m = req.method;
+  const ip = (TRUST_PROXY && (req.headers['fly-client-ip'] || String(req.headers['x-forwarded-for'] || '').split(',')[0].trim())) || req.socket.remoteAddress || 'unknown';
   if (m !== 'GET') {
     const origin = req.headers.origin;
     if (origin && origin !== `${SECURE ? 'https' : 'http'}://${req.headers.host}`) throw httpErr(403, 'Cross-site request blocked.');
@@ -443,6 +451,7 @@ async function api(req, res, url) {
 }
 
 function staticFile(p, res) {
+  if (p === '/healthz') return send(res, 200, { ok: true });
   if (p === '/' || p === '/index.html') {
     res.writeHead(200, { ...baseHeaders(), 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
     return res.end(INDEX_HTML);
@@ -462,5 +471,5 @@ const server = http.createServer(async (req, res) => {
   }
 });
 server.requestTimeout = 15000;
-server.listen(PORT, () => console.log(`Blockcraft running on http://localhost:${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`Blockcraft running on http://localhost:${PORT} (data in ${DATA_DIR})`));
 module.exports = { server, db };
