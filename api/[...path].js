@@ -12,6 +12,8 @@ const ITER = 210000, SESSION_MS = 12 * 3600e3;
 const CTRL = /[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u2028-\u202F\uFEFF]/g;
 const A32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 const SECURE = process.env.COOKIE_SECURE !== '0'; // Vercel is always HTTPS; set COOKIE_SECURE=0 only for plain-http local testing
+// Set REQUIRE_OTP=0 in Vercel to let people sign up and log in with just a password (no authenticator code).
+const REQUIRE_OTP = process.env.REQUIRE_OTP !== '0';
 const RATE_SCALE = Number(process.env.RATE_SCALE) || 1; // tests raise this; keep 1 in production
 const ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || '').split(',').map((x) => x.trim().replace(/\/$/, '')).filter(Boolean);
 
@@ -39,6 +41,7 @@ async function connect() {
       max: 1,              // one connection per function instance; the pooler does the real pooling
       idle_timeout: 20,
       connect_timeout: 10,
+      onnotice: () => {},  // hide harmless "already exists, skipping" notices from CREATE ... IF NOT EXISTS
       ssl: local ? false : 'require',
       // bigint columns hold millisecond timestamps and ids; return them as plain numbers (safe below 2^53)
       types: { bigint: { to: 20, from: [20], serialize: (x) => String(x), parse: (x) => Number(x) } },
@@ -216,6 +219,24 @@ function validate({ username, email, phone, password }) {
   return { username: u, email: e, phone: p, password: pw };
 }
 
+// Creates the account, its profile row and (optionally) removes the pending sign-up, all in one transaction.
+async function createAccount(d, step, pendingId) {
+  try {
+    return await transaction(async (q) => {
+      const r = await q(
+        'INSERT INTO users (username, email, phone, pw_salt, pw_hash, totp_enc, last_step, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id',
+        [d.username, d.email, d.phone, d.pw_salt, d.pw_hash, d.totp, step, Date.now()],
+      );
+      await q('INSERT INTO profiles (user_id) VALUES (?)', [r[0].id]);
+      if (pendingId) await q('DELETE FROM pending WHERE id = ?', [pendingId]);
+      return Number(r[0].id);
+    });
+  } catch (e) {
+    if (isUniqueViolation(e)) throw httpErr(409, 'That username or email is already registered.');
+    throw e;
+  }
+}
+
 async function makePending(kind, uid, data, ttl) {
   const id = rid(24);
   await run('INSERT INTO pending (id, kind, user_id, data, expires, fails) VALUES (?, ?, ?, ?, ?, 0)', [id, kind, uid, JSON.stringify(data), Date.now() + ttl]);
@@ -342,6 +363,13 @@ async function route(req, res) {
       throw httpErr(409, 'That username or email is already registered.');
     const salt = crypto.randomBytes(16);
     const secret = b32encode(crypto.randomBytes(20));
+    if (!REQUIRE_OTP) { // password only: create the account now and sign the person in
+      const uid = await createAccount({
+        username: v.username, email: v.email, phone: v.phone,
+        pw_salt: salt.toString('base64'), pw_hash: await hashPw(v.password, salt), totp: seal(secret),
+      }, 0, null);
+      return startSession(res, uid, v.username);
+    }
     const pending = await makePending('signup', null, {
       username: v.username, email: v.email, phone: v.phone,
       pw_salt: salt.toString('base64'), pw_hash: await hashPw(v.password, salt), totp: seal(secret),
@@ -363,21 +391,7 @@ async function route(req, res) {
       await run('UPDATE pending SET fails = fails + 1 WHERE id = ?', [row.id]);
       throw httpErr(401, 'That code is not valid or has expired.');
     }
-    let uid;
-    try {
-      uid = await transaction(async (q) => { // one all-or-nothing step: the account, its profile row, and removal of the pending sign-up
-        const r = await q(
-          'INSERT INTO users (username, email, phone, pw_salt, pw_hash, totp_enc, last_step, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id',
-          [d.username, d.email, d.phone, d.pw_salt, d.pw_hash, d.totp, step, Date.now()],
-        );
-        await q('INSERT INTO profiles (user_id) VALUES (?)', [r[0].id]);
-        await q('DELETE FROM pending WHERE id = ?', [row.id]);
-        return Number(r[0].id);
-      });
-    } catch (e) {
-      if (isUniqueViolation(e)) throw httpErr(409, 'That username or email is already registered.');
-      throw e;
-    }
+    const uid = await createAccount(d, step, row.id);
     return startSession(res, uid, d.username);
   }
 
@@ -393,6 +407,10 @@ async function route(req, res) {
     if (!u || !same(h, u.pw_hash)) {
       if (u) await penalize(u);
       throw httpErr(401, 'Invalid email or password.');
+    }
+    if (!REQUIRE_OTP) { // password only: finish the sign-in now
+      await run('UPDATE users SET fails = 0, lock_until = 0 WHERE id = ?', [u.id]);
+      return startSession(res, Number(u.id), String(u.username));
     }
     // The failure counter is only cleared after a full sign-in, so a stolen password cannot reset the lockout.
     return send(res, 200, { pending: await makePending('login', Number(u.id), {}, 5 * 60e3) });
