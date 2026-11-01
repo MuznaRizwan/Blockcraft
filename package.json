@@ -5,7 +5,10 @@
   "description": "Blockcraft on Vercel: static game page plus a serverless API backed by Turso (libSQL)",
   "engines": { "node": "22.x" },
   "dependencies": {
-    "@libsql/client": "^0.15.0"
+    "@supabase/supabase-js": "^2.118.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.1",
+    "postgres": "^4.0.0"
   },
   "scripts": {
     "test": "node --test tests/api.test.js"
