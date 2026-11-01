@@ -150,7 +150,7 @@ footer{border-top:2px solid var(--line);padding:16px;text-align:center;font-size
  <section data-view="signup" hidden>
   <form class="auth card" id="f-signup" novalidate>
    <h1 tabindex="-1">Create account</h1>
-   <p class="muted">Your account is stored on this device only. Your password is hashed and an authenticator app adds a second step.</p>
+   <p class="muted">Your password is stored only as a salted hash on our server, and an authenticator app adds a second step.</p>
    <div class="field"><label for="s-user">Username</label><input id="s-user" name="username" type="text" autocomplete="username" maxlength="20" required><p class="err" role="alert"></p></div>
    <div class="field"><label for="s-email">Email</label><input id="s-email" name="email" type="email" autocomplete="email" inputmode="email" maxlength="254" required><p class="err" role="alert"></p></div>
    <div class="field"><label for="s-phone">Phone (with country code)</label><input id="s-phone" name="phone" type="tel" autocomplete="tel" inputmode="tel" maxlength="20" required><p class="err" role="alert"></p></div>
@@ -182,9 +182,10 @@ footer{border-top:2px solid var(--line);padding:16px;text-align:center;font-size
    <div class="card"><p class="muted">Best round</p><div class="stat" id="st-best">None yet</div></div>
   </div>
   <div class="grid">
-   <div class="card"><h2>Saved worlds</h2><ul class="wlist" id="w-list"></ul><p class="muted" id="w-empty">No worlds saved yet. Build something, then press Save world on the Play screen.</p><button class="btn pri" id="w-new" type="button">New world</button></div>
+   <div class="card"><h2>Saved worlds</h2><ul class="wlist" id="w-list"></ul><p class="muted" id="w-empty">No worlds saved yet. Build something, then press Save world on the Play screen.</p><button class="btn pri" id="w-new" type="button">New world</button>
+   <p class="muted" id="w-msg" role="status"></p></div>
    <div class="card"><h2>Recent games</h2><ul class="wlist" id="h-list"></ul><p class="muted" id="h-empty">No finished games yet. Start a game on the Play screen.</p></div>
-   <div class="card"><h2>Account security</h2><p class="muted">One-time code sign-in is not set up yet.</p></div>
+   <div class="card"><h2>Account security</h2><p class="muted">Every sign-in needs a code from your authenticator app.</p></div>
   </div>
  </section>
 
@@ -233,18 +234,39 @@ footer{border-top:2px solid var(--line);padding:16px;text-align:center;font-size
 (function(){
 var $=function(s,r){return (r||document).querySelector(s)},$$=function(s,r){return Array.prototype.slice.call((r||document).querySelectorAll(s))};
 var root=document.documentElement,nav=$("#nav"),burger=$("#burger"),user=null,flash="",route="home";
-try{user=localStorage.getItem("blockcraft.user")}catch(e){}
-function save(){try{user?localStorage.setItem("blockcraft.user",user):localStorage.removeItem("blockcraft.user")}catch(e){}}
-var ST={placed:0,broken:0,secs:0};
-function loadStats(){
- ST={placed:0,broken:0,secs:0};
- try{var j=JSON.parse(localStorage.getItem("blockcraft.stats."+user)||"null");if(j)ST={placed:j.placed|0,broken:j.broken|0,secs:j.secs|0}}catch(e){}
+function save(){}
+window.bcUser=function(){return user};
+function api(method,url,body){
+ var o={method:method,credentials:"same-origin",headers:{}};
+ if(body!==undefined){o.headers["Content-Type"]="application/json";o.body=JSON.stringify(body)}
+ return fetch(url,o).catch(function(){throw new Error("Cannot reach the server. Check your connection.")}).then(function(r){
+  return r.json().catch(function(){return {}}).then(function(j){
+   if(!r.ok){var e=new Error(j.error||"Request failed.");e.status=r.status;throw e}
+   return j;
+  });
+ });
 }
-function saveStats(){try{localStorage.setItem("blockcraft.stats."+user,JSON.stringify(ST))}catch(e){}}
+window.bcApi=api;
+var ST={placed:0,broken:0,secs:0};
+var PEND={placed:0,broken:0,secs:0};
+function loadStats(){
+ if(!user)return Promise.resolve();
+ return api("GET","/api/profile").then(function(j){
+  ST={placed:(j.stats.placed|0)+PEND.placed,broken:(j.stats.broken|0)+PEND.broken,secs:(j.stats.secs|0)+PEND.secs};
+  renderStats();
+ }).catch(function(){});
+}
+function flush(){
+ if(!user||(!PEND.secs&&!PEND.placed&&!PEND.broken))return Promise.resolve();
+ var d=PEND;PEND={placed:0,broken:0,secs:0};
+ return api("POST","/api/stats",d).catch(function(){PEND.secs+=d.secs;PEND.placed+=d.placed;PEND.broken+=d.broken});
+}
 function fmt(s){var m=Math.floor(s/60);return m<60?m+" min":Math.floor(m/60)+" h "+(m%60)+" min"}
 function renderStats(){$("#st-time").textContent=fmt(ST.secs);$("#st-placed").textContent=ST.placed;$("#st-broken").textContent=ST.broken}
-window.addEventListener("shell:edit",function(e){if(!user)return;if(String(e.detail).indexOf("place")===0)ST.placed++;else ST.broken++;saveStats();renderStats()});
-setInterval(function(){if(user&&route==="play"&&!document.hidden){ST.secs++;saveStats()}},1000);
+window.addEventListener("shell:edit",function(e){if(!user)return;if(String(e.detail).indexOf("place")===0){ST.placed++;PEND.placed++}else{ST.broken++;PEND.broken++}renderStats()});
+setInterval(function(){if(user&&route==="play"&&!document.hidden){ST.secs++;PEND.secs++;renderStats()}},1000);
+setInterval(flush,15000);
+window.addEventListener("pagehide",flush);
 
 var R={home:{},login:{guest:1},signup:{guest:1},verify:{guest:1},dashboard:{auth:1},play:{auth:1}};
 var T={home:"Blockcraft",login:"Log in",signup:"Create account",verify:"Verify",dashboard:"Dashboard",play:"Play"};
@@ -258,13 +280,13 @@ function go(){
 }
 function to(r){if(location.hash==="#"+r)show(r);else location.hash=r}
 function show(r){
- route=r;
+ route=r;if(r!=="play")flush();
  $$("[data-view]").forEach(function(s){s.hidden=s.dataset.view!==r});
  $$("nav [data-r]").forEach(function(a){a.dataset.r===r?a.setAttribute("aria-current","page"):a.removeAttribute("aria-current")});
  $$("[data-show]").forEach(function(e){e.hidden=(e.dataset.show==="in")!==!!user});
  document.title=(r==="home"?"":T[r]+" | ")+"Blockcraft";
  var f=$("#flash");f.hidden=!(flash&&r==="login");f.textContent=flash;flash="";
- if(user){$("#who").textContent=user;loadStats();renderStats()}
+ if(user){$("#who").textContent=user;flush().then(function(){return loadStats()})}
  closeMenu();window.scrollTo(0,0);
  var h=$('[data-view="'+r+'"] h1');if(h)h.focus({preventScroll:true});
  window.dispatchEvent(new CustomEvent("shell:route",{detail:r}));
@@ -276,24 +298,27 @@ burger.onclick=function(){var o=nav.classList.toggle("open");burger.setAttribute
 document.addEventListener("keydown",function(e){if(e.key==="Escape"&&nav.classList.contains("open")){closeMenu();burger.focus()}});
 matchMedia("(min-width:761px)").addEventListener("change",closeMenu);
 $("#skip").onclick=function(){$("#main").focus()};
-$("#logout").onclick=function(){user=null;save();to("home");if(location.hash==="#home")show("home")};
+$("#logout").onclick=function(){flush();api("POST","/api/logout",{}).catch(function(){});user=null;PEND={placed:0,broken:0,secs:0};ST={placed:0,broken:0,secs:0};renderStats();to("home");if(location.hash==="#home")show("home")};
 
 function isDark(){var t=root.dataset.theme;return t?t==="dark":matchMedia("(prefers-color-scheme: dark)").matches}
 function themeLabel(){$("#theme").textContent=isDark()?"Light mode":"Dark mode"}
 $("#theme").onclick=function(){root.dataset.theme=isDark()?"light":"dark";themeLabel()};
 themeLabel();
 
+var CTRL=/[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u2028-\u202F\uFEFF]/g;
+function clean(v,max){return String(v==null?"":v).normalize("NFKC").replace(CTRL,"").trim().slice(0,max||254)}
+function cleanPw(v){return String(v==null?"":v).normalize("NFKC").replace(CTRL,"").slice(0,128)}
 var PW=[["12+ characters",/.{12,}/],["Uppercase",/[A-Z]/],["Lowercase",/[a-z]/],["Number",/\d/],["Special character",/[^A-Za-z0-9]/]];
 var V={
  username:function(v){return /^[A-Za-z0-9_]{3,20}$/.test(v)?"":"Use 3 to 20 letters, numbers or underscores."},
  email:function(v){return v.length<=254&&/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(v)?"":"Enter a valid email address."},
  phone:function(v){var d=v.replace(/[\s\-()]/g,"").replace(/^\+/,"");return /^\d{10,15}$/.test(d)?"":"Enter 10 to 15 digits including the country code."},
  password:function(v){return PW.every(function(p){return p[1].test(v)})?"":"Meet every password rule below."},
- confirm:function(v,f){return v&&v===f.elements.password.value?"":"Passwords must match."},
+ confirm:function(v,f){return v&&v===cleanPw(f.elements.password.value)?"":"Passwords must match."},
  loginpw:function(v){return v?"":"Enter your password."}
 };
 function check(input,f,key){
- var m=V[key||input.name](input.value.trim?input.value:input.value,f),p=input.closest(".field").querySelector(".err");
+ var v=input.type==="password"?cleanPw(input.value):clean(input.value,input.maxLength>0?input.maxLength:254);if(input.type!=="password"&&v!==input.value)input.value=v;var m=V[key||input.name](v,f),p=input.closest(".field").querySelector(".err");
  p.textContent=m;m?input.setAttribute("aria-invalid","true"):input.removeAttribute("aria-invalid");return !m;
 }
 function bind(form,map,onOk){
@@ -310,64 +335,38 @@ function bind(form,map,onOk){
 var fs=$("#f-signup"),rules=$("#rules");
 rules.innerHTML=PW.map(function(p){return "<li>"+p[0]+"</li>"}).join("");
 fs.elements.password.addEventListener("input",function(){var v=this.value;$$("li",rules).forEach(function(li,i){li.classList.toggle("ok",PW[i][1].test(v))})});
-var pend=null,ACC="blockcraft.accounts",enc=new TextEncoder(),A32="ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-function accts(){try{return JSON.parse(localStorage.getItem(ACC)||"[]")}catch(e){return []}}
-function putAccts(a){try{localStorage.setItem(ACC,JSON.stringify(a));return true}catch(e){return false}}
-function store(a){putAccts(accts().map(function(x){return x.u===a.u?a:x}))}
-function b64(buf){var a=new Uint8Array(buf),t="";for(var i=0;i<a.length;i++)t+=String.fromCharCode(a[i]);return btoa(t)}
-function unb64(t){var b=atob(t),a=new Uint8Array(b.length);for(var i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a}
-function b32e(a){var v=0,n=0,o="";for(var i=0;i<a.length;i++){v=(v<<8)|a[i];n+=8;while(n>=5){o+=A32[(v>>>(n-5))&31];n-=5}}if(n>0)o+=A32[(v<<(5-n))&31];return o}
-function b32d(t){var v=0,n=0,o=[];for(var i=0;i<t.length;i++){v=(v<<5)|A32.indexOf(t[i]);n+=5;if(n>=8){o.push((v>>>(n-8))&255);n-=8}}return new Uint8Array(o)}
-function hashPw(pw,salt){
- return crypto.subtle.importKey("raw",enc.encode(String(pw).normalize("NFKC")),"PBKDF2",false,["deriveBits"])
- .then(function(k){return crypto.subtle.deriveBits({name:"PBKDF2",salt:salt,iterations:210000,hash:"SHA-256"},k,256)}).then(b64);
-}
-function same(a,b){if(a.length!==b.length)return false;var r=0;for(var i=0;i<a.length;i++)r|=a.charCodeAt(i)^b.charCodeAt(i);return r===0}
-function totp(sec,t){
- var c=new Uint8Array(8),n=Math.floor(t/30000);for(var i=7;i>=0;i--){c[i]=n&255;n=Math.floor(n/256)}
- return crypto.subtle.importKey("raw",b32d(sec),{name:"HMAC",hash:"SHA-1"},false,["sign"])
- .then(function(k){return crypto.subtle.sign("HMAC",k,c)})
- .then(function(g){var h=new Uint8Array(g),o=h[19]&15,v=(((h[o]&127)<<24)|(h[o+1]<<16)|(h[o+2]<<8)|h[o+3])%1000000;return ("000000"+v).slice(-6)});
-}
-function checkCode(sec,code){var now=Date.now();return Promise.all([-1,0,1].map(function(d){return totp(sec,now+d*30000)})).then(function(l){return l.indexOf(code)>-1})}
+var pend=null;
 function fieldErr(input,m){var p=input.closest(".field").querySelector(".err");p.textContent=m;m?input.setAttribute("aria-invalid","true"):input.removeAttribute("aria-invalid")}
-function penalize(a){a.fails=(a.fails|0)+1;if(a.fails>=5)a.lockUntil=Date.now()+Math.min(900000,30000*Math.pow(2,a.fails-5))}
-function lockMsg(a){return "Too many attempts. Try again in "+Math.ceil((a.lockUntil-Date.now())/1000)+" seconds."}
+function formErr(f,msg){var n=/username/i.test(msg)?"username":/email/i.test(msg)?"email":/digits|phone/i.test(msg)?"phone":"password";fieldErr(f.elements[n],msg)}
 function openVerify(){
  var su=pend.mode==="signup";
  $("#v-setup").hidden=!su;
  $("#v-text").textContent=su?"Open an authenticator app (Google Authenticator, Authy or 1Password), add an account with manual entry, choose time-based, and type the key below. Then enter the 6-digit code it shows.":"Enter the 6-digit code from your authenticator app.";
- if(su)$("#v-secret").textContent=pend.a.secret.replace(/(.{4})/g,"$1 ").trim();
+ if(su)$("#v-secret").textContent=pend.secret.replace(/(.{4})/g,"$1 ").trim();
  to("verify");
 }
 bind(fs,{username:"username",email:"email",phone:"phone",password:"password",confirm:"confirm"},function(f){
- var uN=f.elements.username.value.trim(),em=f.elements.email.value.trim().toLowerCase(),ph=f.elements.phone.value.replace(/[\s\-()]/g,"").replace(/^\+/,""),pw=f.elements.password.value;
- if(accts().some(function(a){return a.u.toLowerCase()===uN.toLowerCase()||a.email===em})){fieldErr(f.elements.email,"That username or email is already registered.");return}
- var salt=crypto.getRandomValues(new Uint8Array(16)),sec=b32e(crypto.getRandomValues(new Uint8Array(20)));
- hashPw(pw,salt).then(function(h){
-  pend={mode:"signup",a:{u:uN,email:em,phone:ph,salt:b64(salt),hash:h,secret:sec,fails:0,lockUntil:0}};
-  f.reset();$$("li",rules).forEach(function(li){li.classList.remove("ok")});openVerify();
- }).catch(function(){fieldErr(f.elements.password,"Secure sign-up is not available in this browser.")});
+ api("POST","/api/signup",{username:f.elements.username.value,email:f.elements.email.value,phone:f.elements.phone.value,password:cleanPw(f.elements.password.value)}).then(function(j){
+  pend={mode:"signup",id:j.pending,secret:j.secret};
+  $$("li",rules).forEach(function(li){li.classList.remove("ok")});
+  f.reset();openVerify();
+ }).catch(function(e){formErr(f,e.message)});
 });
 bind($("#f-login"),{email:"email",password:"loginpw"},function(f){
- var em=f.elements.email.value.trim().toLowerCase(),pw=f.elements.password.value,a=accts().filter(function(x){return x.email===em})[0];
- if(a&&a.lockUntil>Date.now()){fieldErr(f.elements.password,lockMsg(a));return}
- hashPw(pw,a?unb64(a.salt):crypto.getRandomValues(new Uint8Array(16))).then(function(h){
-  if(!a||!same(h,a.hash)){if(a){penalize(a);store(a)}fieldErr(f.elements.password,"Invalid email or password.");return}
-  a.fails=0;store(a);pend={mode:"login",a:a};f.reset();openVerify();
- });
+ api("POST","/api/login",{email:f.elements.email.value,password:cleanPw(f.elements.password.value)}).then(function(j){
+  pend={mode:"login",id:j.pending};f.reset();openVerify();
+ }).catch(function(e){fieldErr(f.elements.password,e.message)});
 });
 $("#f-verify").addEventListener("submit",function(e){
  e.preventDefault();
- var inp=this.elements.code,code=String(inp.value).replace(/\s/g,""),a=pend&&pend.a;
- if(!a){to("login");return}
+ var inp=this.elements.code,code=String(inp.value).replace(/\s/g,"");
+ if(!pend){to("login");return}
  if(!/^\d{6}$/.test(code)){fieldErr(inp,"Enter the 6-digit code.");return}
- if(a.lockUntil>Date.now()){fieldErr(inp,lockMsg(a));return}
- checkCode(a.secret,code).then(function(ok){
-  if(!ok){penalize(a);if(pend.mode==="login")store(a);fieldErr(inp,"That code is not valid or has expired.");return}
-  a.fails=0;a.lockUntil=0;
-  if(pend.mode==="signup"){var l=accts();l.push(a);if(!putAccts(l)){fieldErr(inp,"Could not save your account. Browser storage is blocked.");return}}else store(a);
-  user=a.u;save();pend=null;inp.value="";fieldErr(inp,"");to("dashboard");
+ api("POST",pend.mode==="signup"?"/api/signup/confirm":"/api/login/confirm",{pending:pend.id,code:code}).then(function(j){
+  user=j.user.username;pend=null;inp.value="";fieldErr(inp,"");to("dashboard");
+ }).catch(function(err){
+  fieldErr(inp,err.message);
+  if(err.status===400){pend=null;setTimeout(function(){to("login")},1200)}
  });
 });
 
@@ -386,7 +385,7 @@ var gr=$("#game-root");
 if(window.ResizeObserver)new ResizeObserver(function(){window.dispatchEvent(new CustomEvent("shell:resize",{detail:{w:gr.clientWidth,h:gr.clientHeight}}))}).observe(gr);
 window.Blockcraft={mount:gr};
 
-go();
+api("GET","/api/me").then(function(j){user=j.user?j.user.username:null}).catch(function(){user=null}).then(function(){go()});
 })();
 </script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
@@ -572,12 +571,12 @@ if(!document.querySelector('[data-view="play"]').hidden)enter();
 <script>
 (function(){
 var $=function(s){return document.getElementById(s)};
-var gs,owner=null,best={round:0,score:0},inv={};
+var gs,owner,best={round:0,score:0},inv={};
 var NAME={1:"Grass",2:"Dirt",3:"Stone",4:"Sand",5:"Wood",6:"Leaves",8:"Glass",9:"Brick"};
 var SLOT={1:0,2:1,3:2,5:3,4:4,8:6,9:7,6:8};
 function key(u){return "blockcraft.game."+u}
-function load(u){best={round:0,score:0};try{var j=JSON.parse(localStorage.getItem(key(u))||"null");if(j)best={round:j.round|0,score:j.score|0}}catch(e){}}
-function save(){if(owner)try{localStorage.setItem(key(owner),JSON.stringify(best))}catch(e){}}
+function load(u){best={round:0,score:0};if(u&&window.bcApi)window.bcApi("GET","/api/profile").then(function(j){if(j.best&&owner===u){best={round:j.best.round,score:j.best.score};render()}}).catch(function(){})}
+function save(){}
 function o(v,t,n){return {v:v,t:t,n:n,got:0}}
 function quest(r){
  if(r===1)return [o("break",5,4)];
@@ -588,18 +587,6 @@ function quest(r){
 }
 function timeFor(r){return 110+10*r}
 function reset(){gs={state:"idle",round:1,q:[],time:0,tries:3,score:0};inv={}}
-reset();
-var STATES=["idle","playing","won","failed","over"];
-window.Blockcraft.getGame=function(){
- var inventory=[];Object.keys(inv).forEach(function(k){if(inv[k]>0)inventory.push([+k,inv[k]|0])});
- return {state:STATES.indexOf(gs.state),round:gs.round,tries:gs.tries,score:gs.score,time:gs.time,got:gs.q.map(function(x){return x.got|0}),inv:inventory};
-};
-function applyShared(g){
- reset();
- gs.state=STATES[g.state]||"idle";gs.round=Math.max(1,g.round|0);gs.tries=g.tries|0;gs.score=g.score|0;
- if(gs.state!=="idle"){gs.q=quest(gs.round);gs.q.forEach(function(x,i){x.got=g.got[i]|0});gs.time=Math.min(g.time|0,timeFor(gs.round))}
- g.inv.forEach(function(e){inv[e[0]]=e[1]});
-}
 function active(){return gs.state==="playing"||gs.state==="won"||gs.state==="failed"}
 function msg(t){$("g-msg").textContent=t}
 function qtext(){return "Round "+gs.round+": "+gs.q.map(function(x){return (x.v==="break"?"collect ":"place ")+x.n+" "+NAME[x.t]+" ("+Math.min(x.got,x.n)+"/"+x.n+")"}).join(", then ")+"."}
@@ -623,7 +610,7 @@ function render(){
 function lose(why){
  gs.tries--;
  if(gs.tries>0){gs.state="failed";msg(why+" "+gs.tries+(gs.tries===1?" attempt":" attempts")+" left.")}
- else{gs.state="over";window.dispatchEvent(new CustomEvent("shell:gameover",{detail:{round:gs.round,score:gs.score}}));msg("Game over at round "+gs.round+" with "+gs.score+" points. Free build is back on.")}
+ else{gs.state="over";window.dispatchEvent(new CustomEvent("shell:gameover",{detail:{round:gs.round,score:gs.score,over:true}}));msg("Game over at round "+gs.round+" with "+gs.score+" points. Free build is back on.")}
  render();
 }
 $("g-btn").onclick=function(){
@@ -646,7 +633,7 @@ window.addEventListener("shell:edit",function(e){
   if(gs.q.every(function(x){return x.got>=x.n})){
    var pts=100*gs.round+gs.time*2;gs.score+=pts;gs.state="won";
    if(gs.round>best.round||(gs.round===best.round&&gs.score>best.score)){best.round=gs.round;best.score=gs.score}
-   save();msg("Round "+gs.round+" complete! +"+pts+" points. Keep building, or press Next round.");
+   window.dispatchEvent(new CustomEvent("shell:gameover",{detail:{round:gs.round,score:gs.score,over:false}}));msg("Round "+gs.round+" complete! +"+pts+" points. Keep building, or press Next round.");
   }else msg(qtext());
  }
  render();
@@ -656,16 +643,9 @@ setInterval(function(){
  gs.time--;
  if(gs.time<=0){gs.time=0;lose("Time ran out.")}else render();
 },1000);
-function onRoute(ev){
- var u=null;try{u=localStorage.getItem("blockcraft.user")}catch(x){}
- if(u!==owner){owner=u;reset();if(u)load(u);else best={round:0,score:0};msg("Press Start game for a survival-style challenge, or just build freely.")}
- var B=window.Blockcraft;
- if(ev&&ev.detail==="play"&&B.pendingGame){
-  var g=B.pendingGame,note=B.pendingNote||"Opened shared game.";B.pendingGame=null;B.pendingNote=null;
-  applyShared(g);render();
-  msg(note+" "+(gs.state==="idle"?"Press Start game for a survival-style challenge, or just build freely.":gs.state==="over"?"The shared game was over at round "+gs.round+" with "+gs.score+" points.":gs.state==="won"?"Round "+gs.round+" is complete. Press Next round to continue.":gs.state==="failed"?gs.tries+(gs.tries===1?" attempt":" attempts")+" left. Press Retry round.":qtext()));
-  return;
- }
+function onRoute(){
+ var u=window.bcUser?window.bcUser():null;
+ if(!gs||u!==owner){owner=u;reset();if(u)load(u);else best={round:0,score:0};msg("Press Start game for a survival-style challenge, or just build freely.")}
  render();
 }
 window.addEventListener("shell:route",onRoute);
@@ -674,51 +654,47 @@ onRoute();
 </script>
 <script>
 (function(){
-var $=function(s){return document.getElementById(s)},B=window.Blockcraft;
-function user(){try{return localStorage.getItem("blockcraft.user")}catch(e){return null}}
-function rd(k){try{return JSON.parse(localStorage.getItem(k)||"[]")}catch(e){return []}}
-function wr(k,v){try{localStorage.setItem(k,JSON.stringify(v));return true}catch(e){return false}}
-function wk(){return "blockcraft.worlds."+user()}
-function hk(){return "blockcraft.history."+user()}
+var $=function(s){return document.getElementById(s)},B=window.Blockcraft,api=window.bcApi;
+function signedIn(){return !!(window.bcUser&&window.bcUser())}
 function esc(t){return String(t).replace(/[&<>"']/g,function(c){return "&#"+c.charCodeAt(0)+";"})}
 function ago(ts){var m=Math.round((Date.now()-ts)/60000);return m<1?"just now":m<60?m+" min ago":m<1440?Math.round(m/60)+" h ago":Math.round(m/1440)+" d ago"}
-function say(t){$("g-msg").textContent=t}
-function render(){
- var u=user(),ws=u?rd(wk()):[],h=u?rd(hk()):[];
- $("w-list").innerHTML=ws.map(function(w){return '<li><div><b>'+esc(w.name)+'</b><br><span class="muted">'+w.edits.length+' changes, saved '+ago(w.saved)+'</span></div><div class="wact"><button class="btn" data-load="'+w.id+'" type="button">Load</button><button class="btn" data-del="'+w.id+'" type="button">Delete</button></div></li>'}).join("");
- $("w-empty").hidden=ws.length>0;
- $("h-list").innerHTML=h.map(function(g){return '<li><b>Round '+g.round+'</b><span>'+g.score+' pts</span><span class="muted">'+ago(g.date)+'</span></li>'}).join("");
- $("h-empty").hidden=h.length>0;
+function sayPlay(t){$("g-msg").textContent=t}
+function sayDash(t){$("w-msg").textContent=t}
+function refresh(){
+ if(!signedIn()){$("w-list").innerHTML="";$("w-empty").hidden=false;$("h-list").innerHTML="";$("h-empty").hidden=false;return}
+ api("GET","/api/worlds").then(function(j){
+  var ws=j.worlds;
+  $("w-list").innerHTML=ws.map(function(w){return '<li><div><b>'+esc(w.name)+'</b><br><span class="muted">'+esc(w.changes)+' changes, saved '+ago(w.saved)+'</span></div><div class="wact"><button class="btn" data-load="'+esc(w.id)+'" type="button">Load</button><button class="btn" data-del="'+esc(w.id)+'" type="button">Delete</button></div></li>'}).join("");
+  $("w-empty").hidden=ws.length>0;
+ }).catch(function(){});
+ api("GET","/api/profile").then(function(j){
+  var h=j.history;
+  $("h-list").innerHTML=h.map(function(g){return '<li><b>Round '+esc(g.round)+'</b><span>'+esc(g.score)+' pts</span><span class="muted">'+ago(g.date)+'</span></li>'}).join("");
+  $("h-empty").hidden=h.length>0;
+ }).catch(function(){});
 }
 $("save").onclick=function(){
- var u=user();if(!u)return;
- var ws=rd(wk()),d=B.getDiff(),cur=B.current,now=Date.now();
- var w=cur&&ws.filter(function(x){return x.id===cur.id})[0];
- if(w){w.edits=d;w.saved=now}
- else{
-  if(ws.length>=8){say("You can keep 8 worlds. Delete one on the dashboard first.");return}
-  w={id:"w"+now,name:"World "+(ws.length+1),saved:now,edits:d};ws.push(w);B.current={id:w.id,name:w.name};
- }
- say(wr(wk(),ws)?"Saved "+w.name+" with "+d.length+" changes. Find it on your dashboard.":"Could not save: browser storage is full or blocked.");
- render();
+ if(!signedIn())return;
+ var cur=B.current,d=B.getDiff();
+ var id=cur?cur.id:"w"+Date.now().toString(36)+crypto.getRandomValues(new Uint32Array(1))[0].toString(36);
+ api("PUT","/api/worlds/"+encodeURIComponent(id),{name:cur?cur.name:"New world",edits:d}).then(function(j){
+  B.current={id:j.id,name:j.name};
+  sayPlay("Saved "+j.name+" with "+j.changes+" changes. Find it on your dashboard.");
+  refresh();
+ }).catch(function(e){sayPlay(e.message)});
 };
 $("w-list").addEventListener("click",function(e){
- var t=e.target,ws=rd(wk());
- if(t.getAttribute("data-load")){
-  var w=ws.filter(function(x){return x.id===t.getAttribute("data-load")})[0];if(!w)return;
-  B.pending=w.edits;B.current={id:w.id,name:w.name};location.hash="play";
- }else if(t.getAttribute("data-del")){
-  var id=t.getAttribute("data-del");wr(wk(),ws.filter(function(x){return x.id!==id}));
-  if(B.current&&B.current.id===id)B.current=null;render();
- }
+ var t=e.target,id=t.getAttribute("data-load"),del=t.getAttribute("data-del");
+ if(id){api("GET","/api/worlds/"+encodeURIComponent(id)).then(function(j){B.pending=j.edits;B.current={id:j.id,name:j.name};location.hash="play"}).catch(function(err){sayDash(err.message)})}
+ else if(del){api("DELETE","/api/worlds/"+encodeURIComponent(del)).then(function(){if(B.current&&B.current.id===del)B.current=null;sayDash("World deleted.");refresh()}).catch(function(err){sayDash(err.message)})}
 });
 $("w-new").onclick=function(){B.pending=[];B.current=null;location.hash="play"};
 window.addEventListener("shell:gameover",function(e){
- var u=user();if(!u)return;
- var h=rd(hk());h.unshift({round:e.detail.round,score:e.detail.score,date:Date.now()});wr(hk(),h.slice(0,5));render();
+ if(!signedIn())return;
+ api("POST","/api/games",{round:e.detail.round,score:e.detail.score,over:!!e.detail.over}).then(refresh).catch(function(){});
 });
-window.addEventListener("shell:route",render);
-render();
+window.addEventListener("shell:route",refresh);
+refresh();
 })();
 </script>
 <script>
@@ -740,16 +716,12 @@ function pipe(u,S,cap){
  })})();
 }
 function cleanName(t){return String(t||"").normalize("NFKC").replace(/[^A-Za-z0-9 _-]/g,"").trim().slice(0,24)}
-function encode(edits,name,game){
- var nm=new TextEncoder().encode(cleanName(name)),out=[2,nm.length],last=-1,i,d;
+function encode(edits,name){
+ var nm=new TextEncoder().encode(cleanName(name)),out=[1,nm.length],last=-1,i,d;
  for(i=0;i<nm.length;i++)out.push(nm[i]);
  function wv(x){while(x>=128){out.push((x%128)|128);x=Math.floor(x/128)}out.push(x)}
  wv(edits.length);
  for(i=0;i<edits.length;i++){d=edits[i][0]-last;last=edits[i][0];wv(d);out.push(edits[i][1])}
- game=game||{state:0,round:1,tries:3,score:0,time:0,got:[],inv:[]};
- out.push(game.state);wv(game.round);wv(game.tries);wv(game.score);wv(game.time);
- out.push(game.got.length);for(i=0;i<game.got.length;i++)wv(game.got[i]);
- out.push(game.inv.length);for(i=0;i<game.inv.length;i++){out.push(game.inv[i][0]);wv(game.inv[i][1])}
  var data=Uint8Array.from(out),flag=0,job=Promise.resolve();
  if(window.CompressionStream)job=pipe(data,window.CompressionStream).then(function(z){if(z.length<data.length){data=z;flag=1}}).catch(function(){});
  return job.then(function(){var body=cat([Uint8Array.of(flag),data]);return sha4(body).then(function(sum){return bu(cat([body,sum]))})});
@@ -768,37 +740,27 @@ function decode(code){
  }).then(function(data){
   var p=0;
   function rv(){var x=0,sh=0,b;do{if(p>=data.length)throw bad();b=data[p++];x+=(b&127)*Math.pow(2,sh);sh+=7;if(sh>35)throw bad()}while(b&128);return x}
-  var ver=data[p++];if(ver!==1&&ver!==2)throw bad();
+  if(data[p++]!==1)throw bad();
   var nl=data[p++];if(nl>24||p+nl>data.length)throw bad();
   var name=cleanName(new TextDecoder().decode(data.slice(p,p+nl)));p+=nl;
   var cnt=rv();if(cnt>MAXE)throw bad();
-  var edits=[],idx=-1,i;
-  for(i=0;i<cnt;i++){
+  var edits=[],idx=-1;
+  for(var i=0;i<cnt;i++){
    var dl=rv();if(dl<1)throw bad();idx+=dl;if(idx>=CELLS)throw bad();
    var v=data[p++];if(v===undefined||v>9)throw bad();
    edits.push([idx,v]);
   }
-  var game=null;
-  if(ver===2){
-   game={state:data[p++],round:rv(),tries:rv(),score:rv(),time:rv(),got:[],inv:[]};
-   if(!(game.state<=4)||game.round<1||game.round>9999||game.tries>3||game.time>99999||game.score>1e9)throw bad();
-   var nq=data[p++];if(!(nq<=4))throw bad();
-   for(i=0;i<nq;i++){var gv=rv();if(gv>1e6)throw bad();game.got.push(gv)}
-   var ni=data[p++];if(!(ni<=16))throw bad();
-   for(i=0;i<ni;i++){var id=data[p++],c=rv();if(!(id<=15)||c>1e6)throw bad();game.inv.push([id,c])}
-  }
   if(p!==data.length)throw bad();
-  return {name:name,edits:edits,game:game};
+  return {name:name,edits:edits};
  });
 }
 function say(t){var m=$("g-msg");if(m)m.textContent=t}
-function loggedIn(){try{return !!localStorage.getItem("blockcraft.user")}catch(e){return false}}
+function loggedIn(){return !!(window.bcUser&&window.bcUser())}
 function accept(r){
- B.pending=r.edits;B.current=null;B.pendingGame=r.game;
+ B.pending=r.edits;B.current=null;
  var msg="Opened shared world"+(r.name?" "+r.name:"")+" with "+r.edits.length+" changes.";
- B.pendingNote=r.game?msg:null;
- if(!document.querySelector('[data-view="play"]').hidden){window.dispatchEvent(new CustomEvent("shell:route",{detail:"play"}));if(!r.game)say(msg)}
- else if(loggedIn()){location.hash="play";if(!r.game)setTimeout(function(){say(msg)},150)}
+ if(!document.querySelector('[data-view="play"]').hidden){window.dispatchEvent(new CustomEvent("shell:route",{detail:"play"}));say(msg)}
+ else if(loggedIn()){location.hash="play";setTimeout(function(){say(msg)},150)}
  else{location.hash="login";setTimeout(function(){var f=$("flash");if(f){f.hidden=false;f.textContent="A shared world is ready. Log in, then open Play to see it."}},80)}
  try{if(location.search)history.replaceState(null,"",location.pathname+location.hash)}catch(e){}
 }
@@ -806,7 +768,7 @@ function refused(){say("That link or code is not valid, so nothing was loaded.")
 function build(){
  var d=B.getDiff(),note=$("share-note");
  if(d.length>MAXE){note.textContent="This world has too many changes to share ("+d.length+").";return}
- encode(d,B.current&&B.current.name,B.getGame&&B.getGame()).then(function(code){
+ encode(d,B.current&&B.current.name).then(function(code){
   var http=/^https?:$/.test(location.protocol);
   $("share-code").value=code;
   $("share-link").value=http?location.origin+location.pathname+"?w="+code:"Open the game from a web address to get a link. Use the code below.";
