@@ -3,7 +3,6 @@
 // Database: Supabase (Postgres), reached through Supabase's connection pooler. Every database call is async, so every one is awaited.
 const crypto = require('node:crypto');
 const { promisify } = require('node:util');
-const postgres = require('postgres');
 const pbkdf2 = promisify(crypto.pbkdf2);
 
 const N = 48, H = 24, CELLS = N * N * H, LAYER = N * N;
@@ -18,8 +17,15 @@ const ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || '').split(',').map
 
 // ---------- configuration is read lazily, so a missing setting gives a clear log line ----------
 let _db, _key, _ready;
+// 'postgres' is an ES module, so it is loaded with import() (works from CommonJS). Hence database() returns a promise.
 function database() {
   if (!_db) {
+    _db = connect().catch((e) => { _db = null; throw e; });
+  }
+  return _db;
+}
+async function connect() {
+  {
     // Use the Supabase *transaction pooler* string (port 6543): Dashboard > Connect > Transaction pooler.
     // The Vercel + Supabase integration provides the same thing as POSTGRES_URL.
     const raw = process.env.DATABASE_URL || process.env.POSTGRES_URL;
@@ -27,7 +33,8 @@ function database() {
     const u = new URL(raw);
     u.searchParams.delete('supa'); // added by the Vercel integration; the driver would forward it to the server as an unknown setting
     const local = u.hostname === 'localhost' || u.hostname === '127.0.0.1';
-    _db = postgres(u.toString(), {
+    const postgres = (await import('postgres')).default;
+    return postgres(u.toString(), {
       prepare: false,      // required by the transaction pooler (no prepared statements)
       max: 1,              // one connection per function instance; the pooler does the real pooling
       idle_timeout: 20,
@@ -37,7 +44,6 @@ function database() {
       types: { bigint: { to: 20, from: [20], serialize: (x) => String(x), parse: (x) => Number(x) } },
     });
   }
-  return _db;
 }
 function key() {
   if (!_key) {
@@ -116,18 +122,18 @@ ALTER TABLE rate ENABLE ROW LEVEL SECURITY;
 // Creates the tables on first use. Once they exist you can set AUTO_MIGRATE=0 to skip this step on cold starts.
 function ready() {
   if (process.env.AUTO_MIGRATE === '0') return Promise.resolve();
-  if (!_ready) _ready = database().unsafe(SCHEMA).then(() => undefined).catch((e) => { _ready = null; throw e; });
+  if (!_ready) _ready = database().then((db) => db.unsafe(SCHEMA)).then(() => undefined).catch((e) => { _ready = null; throw e; });
   return _ready;
 }
 
 // ---------- tiny database helpers ----------
 // Queries below are written with ? placeholders; this turns them into Postgres $1, $2, ...
 const pg = (s) => { let i = 0; return s.replace(/\?/g, () => '$' + (++i)); };
-const run = (sql, args = []) => database().unsafe(pg(sql), args);
+const run = async (sql, args = []) => (await database()).unsafe(pg(sql), args);
 const rows = (sql, args) => run(sql, args);
 const one = async (sql, args) => (await rows(sql, args))[0] || null;
 // Runs fn inside one all-or-nothing transaction. fn receives a query function q(sql, args).
-const transaction = (fn) => database().begin((tx) => fn((sql, args = []) => tx.unsafe(pg(sql), args)));
+const transaction = async (fn) => (await database()).begin((tx) => fn((sql, args = []) => tx.unsafe(pg(sql), args)));
 const batch = (stmts) => transaction(async (q) => { for (const s of stmts) await q(s.sql, s.args); });
 
 let lastSweep = 0;
