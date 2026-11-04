@@ -330,8 +330,20 @@ function bodyOf(req) {
 
 // ---------- routes ----------
 async function route(req, res) {
+  console.log('REQUEST METHOD:', req.method);
+  console.log('REQUEST URL:', req.url);
+  
   const p = new URL(req.url, 'http://localhost').pathname.replace(/\/+$/, '') || '/';
   const m = req.method, ip = ipOf(req);
+
+  console.log('[API REQUEST 1]:', m, p);
+  
+  // Handle both Vercel URL formats.
+  if (!p.startsWith('/api/')) {
+    p = '/api' + (p.startsWith('/') ? p : '/' + p);
+  }
+  
+  console.log('[API REQUEST 2]:', m, p);
 
   if (m !== 'GET' && m !== 'HEAD') {
     const origin = req.headers.origin;
@@ -512,7 +524,12 @@ async function route(req, res) {
       return send(res, 200, { id, name, changes: edits.length });
     }
   }
-  throw httpErr(404, 'Not found.');
+  // throw httpErr(404, 'Not found.');
+  return send(res, 404, {
+    error: 'API endpoint not found.',
+    method: m,
+    path: p
+  });
 }
 
 module.exports = async (req, res) => {
