@@ -184,6 +184,7 @@ function b32decode(t) {
   return Buffer.from(o);
 }
 function totpAt(secret, step) {
+  console.log('in totpAt');
   const c = Buffer.alloc(8);
   c.writeBigUInt64BE(BigInt(step));
   const h = crypto.createHmac('sha1', b32decode(secret)).update(c).digest();
@@ -192,6 +193,7 @@ function totpAt(secret, step) {
 }
 // Returns the matched time step, or 0. Steps at or before lastStep are rejected (no code reuse).
 function checkTotp(secret, code, lastStep) {
+  console.log('in checkTotp');
   const s = Math.floor(Date.now() / 30000);
   for (const d of [-1, 0, 1]) if (s + d > lastStep && totpAt(secret, s + d) === code) return s + d;
   return 0;
@@ -205,6 +207,7 @@ function httpErr(status, message) { return Object.assign(new Error(message), { s
 const isUniqueViolation = (e) => e && e.code === '23505'; // Postgres "unique_violation"
 
 function validate({ username, email, phone, password }) {
+  console.log('in validate');
   if ([username, email, phone, password].some((x) => typeof x !== 'string')) throw httpErr(400, 'Every field is required.');
   const u = clean(username, 40);
   const e = clean(email, 254).toLowerCase();
@@ -221,6 +224,7 @@ function validate({ username, email, phone, password }) {
 
 // Creates the account, its profile row and (optionally) removes the pending sign-up, all in one transaction.
 async function createAccount(d, step, pendingId) {
+  console.log('in createAccount');
   try {
     return await transaction(async (q) => {
       const r = await q(
@@ -238,11 +242,13 @@ async function createAccount(d, step, pendingId) {
 }
 
 async function makePending(kind, uid, data, ttl) {
+  console.log('in makePending');
   const id = rid(24);
   await run('INSERT INTO pending (id, kind, user_id, data, expires, fails) VALUES (?, ?, ?, ?, ?, 0)', [id, kind, uid, JSON.stringify(data), Date.now() + ttl]);
   return id;
 }
 async function takePending(id, kind) {
+  console.log('in takePending');
   if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{20,60}$/.test(id)) return null;
   return one('SELECT * FROM pending WHERE id = ? AND kind = ? AND expires > ?', [id, kind, Date.now()]);
 }
@@ -275,12 +281,14 @@ const tokenOf = (req) => {
   return m ? m[1] : null;
 };
 async function currentUser(req) {
+  console.log('in currentUser');
   const t = tokenOf(req);
   if (!t) return null;
   const r = await one('SELECT u.id, u.username FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ? AND s.expires > ?', [sha(t), Date.now()]);
   return r ? { id: Number(r.id), username: String(r.username) } : null;
 }
 async function startSession(res, uid, username) {
+  console.log('in startSession');
   const token = rid(32);
   await run('INSERT INTO sessions (token, user_id, expires) VALUES (?, ?, ?)', [sha(token), uid, Date.now() + SESSION_MS]);
   return send(res, 200, { user: { username } }, {
@@ -391,6 +399,7 @@ async function route(req, res) {
 
   // Sign-up step 2: confirm the authenticator code, then create the account.
   if (m === 'POST' && p === '/api/signup/confirm') {
+    console.log('in /api/signup/confirm');
     if (await limited(ip, 'confirm', 30)) throw httpErr(429, 'Too many attempts. Wait a minute.');
     const row = await takePending(body.pending, 'signup');
     if (!row) throw httpErr(400, 'This sign-up has expired. Start again.');
@@ -409,6 +418,7 @@ async function route(req, res) {
 
   // Sign-in step 1: check the password (with lockout), then hold the sign-in for the code.
   if (m === 'POST' && p === '/api/login') {
+    console.log('in /api/login');
     if (await limited(ip, 'login', 20)) throw httpErr(429, 'Too many sign-in attempts. Wait a minute.');
     const email = clean(body.email, 254).toLowerCase();
     const password = (typeof body.password === 'string' ? body.password : '').normalize('NFKC').replace(CTRL, '');
@@ -430,6 +440,7 @@ async function route(req, res) {
 
   // Sign-in step 2: check the authenticator code (codes cannot be reused).
   if (m === 'POST' && p === '/api/login/confirm') {
+    console.log('in /api/login/confirm');
     if (await limited(ip, 'confirm', 30)) throw httpErr(429, 'Too many attempts. Wait a minute.');
     const row = await takePending(body.pending, 'login');
     if (!row) throw httpErr(400, 'This sign-in has expired. Log in again.');
