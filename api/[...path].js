@@ -242,7 +242,7 @@ async function createAccount(d, step, pendingId) {
 }
 
 async function makePending(kind, uid, data, ttl) {
-  console.log('in makePending');
+  console.log('in makePending', kind, uid, data, ttl);
   const id = rid(24);
   await run('INSERT INTO pending (id, kind, user_id, data, expires, fails) VALUES (?, ?, ?, ?, ?, 0)', [id, kind, uid, JSON.stringify(data), Date.now() + ttl]);
   return id;
