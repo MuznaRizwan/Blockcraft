@@ -283,8 +283,16 @@ const tokenOf = (req) => {
 async function currentUser(req) {
   console.log('in currentUser');
   const t = tokenOf(req);
-  if (!t) return null;
+  if (!t) {
+    console.log('no token t');
+    return null;
+  }
   const r = await one('SELECT u.id, u.username FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ? AND s.expires > ?', [sha(t), Date.now()]);
+  if (r) {
+    console.log('successfully get user session information', u.id, u.username);
+  } else {
+    console.log('unable to get user session information');
+  }
   return r ? { id: Number(r.id), username: String(r.username) } : null;
 }
 async function startSession(res, uid, username) {
